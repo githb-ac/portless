@@ -2,7 +2,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
 import * as tls from "node:tls";
-import { execSync, execFileSync } from "node:child_process";
+import { execFile as execFileCb, execFileSync } from "node:child_process";
+import { promisify } from "node:util";
 
 /** How long the CA certificate is valid (10 years, in days). */
 const CA_VALIDITY_DAYS = 3650;
@@ -84,6 +85,29 @@ function openssl(args: string[], options?: { input?: string }): string {
       input: options?.input,
       stdio: ["pipe", "pipe", "pipe"],
     });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `openssl failed: ${message}\n\nMake sure openssl is installed (ships with macOS and most Linux distributions).`
+    );
+  }
+}
+
+const execFileAsync = promisify(execFileCb);
+
+/**
+ * Run openssl asynchronously and return stdout. Throws on non-zero exit.
+ * Used for on-demand cert generation in the SNI callback to avoid blocking
+ * the event loop.
+ */
+async function opensslAsync(args: string[], options?: { input?: string }): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync("openssl", args, {
+      encoding: "utf-8",
+      timeout: OPENSSL_TIMEOUT_MS,
+      input: options?.input,
+    });
+    return stdout;
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(
@@ -197,6 +221,7 @@ function generateServerCert(stateDir: string): { certPath: string; keyPath: stri
 
   fs.chmodSync(serverKeyPath, 0o600);
   fs.chmodSync(serverCertPath, 0o644);
+  fixOwnership(serverKeyPath, serverCertPath);
 
   return { certPath: serverCertPath, keyPath: serverKeyPath };
 }
@@ -289,7 +314,7 @@ function isCATrustedMacOS(caCertPath: string): boolean {
  */
 function loginKeychainPath(): string {
   try {
-    const result = execSync("security default-keychain", {
+    const result = execFileSync("security", ["default-keychain"], {
       encoding: "utf-8",
       timeout: 5000,
     }).trim();
@@ -340,17 +365,20 @@ function sanitizeHostForFilename(hostname: string): string {
 /**
  * Generate a certificate for a specific hostname, signed by the local CA.
  * Certs are cached on disk in the host-certs subdirectory.
+ *
+ * Uses async openssl calls to avoid blocking the event loop, since this
+ * runs on demand inside the SNI callback during TLS handshakes.
  */
-function generateHostCert(
+async function generateHostCertAsync(
   stateDir: string,
   hostname: string
-): { certPath: string; keyPath: string } {
+): Promise<{ certPath: string; keyPath: string }> {
   const caKeyPath = path.join(stateDir, CA_KEY_FILE);
   const caCertPath = path.join(stateDir, CA_CERT_FILE);
   const hostDir = path.join(stateDir, HOST_CERTS_DIR);
 
   if (!fs.existsSync(hostDir)) {
-    fs.mkdirSync(hostDir, { recursive: true, mode: 0o755 });
+    await fs.promises.mkdir(hostDir, { recursive: true, mode: 0o755 });
     fixOwnership(hostDir);
   }
 
@@ -361,10 +389,10 @@ function generateHostCert(
   const extPath = path.join(hostDir, `${safeName}-ext.cnf`);
 
   // Generate key
-  openssl(["ecparam", "-genkey", "-name", "prime256v1", "-noout", "-out", keyPath]);
+  await opensslAsync(["ecparam", "-genkey", "-name", "prime256v1", "-noout", "-out", keyPath]);
 
   // Generate CSR
-  openssl(["req", "-new", "-key", keyPath, "-out", csrPath, "-subj", `/CN=${hostname}`]);
+  await opensslAsync(["req", "-new", "-key", keyPath, "-out", csrPath, "-subj", `/CN=${hostname}`]);
 
   // Build SAN list: include the exact hostname plus a wildcard at the same level
   // e.g., for "chat.json-render2.localhost" -> also add "*.json-render2.localhost"
@@ -375,7 +403,7 @@ function generateHostCert(
     sans.push(`DNS:*.${parts.slice(1).join(".")}`);
   }
 
-  fs.writeFileSync(
+  await fs.promises.writeFile(
     extPath,
     [
       "authorityKeyIdentifier=keyid,issuer",
@@ -386,7 +414,7 @@ function generateHostCert(
     ].join("\n") + "\n"
   );
 
-  openssl([
+  await opensslAsync([
     "x509",
     "-req",
     "-in",
@@ -407,14 +435,14 @@ function generateHostCert(
   // Clean up temporary files (keep ca.srl for serial number tracking)
   for (const tmp of [csrPath, extPath]) {
     try {
-      fs.unlinkSync(tmp);
+      await fs.promises.unlink(tmp);
     } catch {
       // Non-fatal
     }
   }
 
-  fs.chmodSync(keyPath, 0o600);
-  fs.chmodSync(certPath, 0o644);
+  await fs.promises.chmod(keyPath, 0o600);
+  await fs.promises.chmod(certPath, 0o644);
   fixOwnership(keyPath, certPath);
 
   return { certPath, keyPath };
@@ -436,6 +464,9 @@ function isSimpleLocalhostSubdomain(hostname: string): boolean {
  * For simple hostnames matching `*.localhost`, uses the default server cert.
  * For deeper subdomains (e.g., `chat.myapp.localhost`), generates a
  * per-hostname certificate on demand, signed by the local CA, and caches it.
+ *
+ * Certificate generation is async to avoid blocking the event loop. A
+ * pending-promise map deduplicates concurrent requests for the same hostname.
  */
 export function createSNICallback(
   stateDir: string,
@@ -443,6 +474,7 @@ export function createSNICallback(
   defaultKey: Buffer
 ): (servername: string, cb: (err: Error | null, ctx?: tls.SecureContext) => void) => void {
   const cache = new Map<string, tls.SecureContext>();
+  const pending = new Map<string, Promise<tls.SecureContext>>();
 
   // Pre-cache the default context for simple subdomains
   const defaultCtx = tls.createSecureContext({ cert: defaultCert, key: defaultKey });
@@ -481,18 +513,36 @@ export function createSNICallback(
       }
     }
 
-    // Generate a new cert for this hostname
-    try {
-      const generated = generateHostCert(stateDir, servername);
-      const ctx = tls.createSecureContext({
-        cert: fs.readFileSync(generated.certPath),
-        key: fs.readFileSync(generated.keyPath),
-      });
-      cache.set(servername, ctx);
-      cb(null, ctx);
-    } catch (err: unknown) {
-      cb(err instanceof Error ? err : new Error(String(err)));
+    // If a generation is already in flight for this hostname, wait for it
+    if (pending.has(servername)) {
+      pending
+        .get(servername)!
+        .then((ctx) => cb(null, ctx))
+        .catch((err) => cb(err instanceof Error ? err : new Error(String(err))));
+      return;
     }
+
+    // Generate a new cert for this hostname asynchronously
+    const promise = generateHostCertAsync(stateDir, servername).then(async (generated) => {
+      const [cert, key] = await Promise.all([
+        fs.promises.readFile(generated.certPath),
+        fs.promises.readFile(generated.keyPath),
+      ]);
+      return tls.createSecureContext({ cert, key });
+    });
+
+    pending.set(servername, promise);
+
+    promise
+      .then((ctx) => {
+        cache.set(servername, ctx);
+        pending.delete(servername);
+        cb(null, ctx);
+      })
+      .catch((err) => {
+        pending.delete(servername);
+        cb(err instanceof Error ? err : new Error(String(err)));
+      });
   };
 }
 
@@ -513,15 +563,16 @@ export function trustCA(stateDir: string): { trusted: boolean; error?: string } 
   try {
     if (process.platform === "darwin") {
       const keychain = loginKeychainPath();
-      execSync(`security add-trusted-cert -r trustRoot -k "${keychain}" "${caCertPath}"`, {
-        stdio: "pipe",
-        timeout: 30_000,
-      });
+      execFileSync(
+        "security",
+        ["add-trusted-cert", "-r", "trustRoot", "-k", keychain, caCertPath],
+        { stdio: "pipe", timeout: 30_000 }
+      );
       return { trusted: true };
     } else if (process.platform === "linux") {
       const dest = "/usr/local/share/ca-certificates/portless-ca.crt";
       fs.copyFileSync(caCertPath, dest);
-      execSync("update-ca-certificates", { stdio: "pipe", timeout: 30_000 });
+      execFileSync("update-ca-certificates", [], { stdio: "pipe", timeout: 30_000 });
       return { trusted: true };
     }
     return { trusted: false, error: `Unsupported platform: ${process.platform}` };

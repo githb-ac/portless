@@ -618,8 +618,9 @@ ${chalk.bold("Usage: portless proxy <command>")}
       onWarning: (msg) => console.warn(chalk.yellow(msg)),
     });
 
-    // Check if already running (try both TLS and non-TLS to detect any running proxy)
-    if ((await isProxyRunning(proxyPort, true)) || (await isProxyRunning(proxyPort, false))) {
+    // Check if already running. Plain HTTP check detects both TLS and non-TLS
+    // proxies because the TLS-enabled proxy accepts plain HTTP via byte-peeking.
+    if (await isProxyRunning(proxyPort)) {
       if (isForeground) {
         // Foreground mode is used internally by the daemon fork; exit silently
         return;
