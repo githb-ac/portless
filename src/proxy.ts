@@ -8,6 +8,30 @@ import { escapeHtml, formatUrl } from "./utils.js";
 export const PORTLESS_HEADER = "X-Portless";
 
 /**
+ * HTTP/1.1 hop-by-hop headers that are forbidden in HTTP/2 responses.
+ * These must be stripped when proxying an HTTP/1.1 backend response
+ * back to an HTTP/2 client.
+ */
+const HOP_BY_HOP_HEADERS = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-connection",
+  "transfer-encoding",
+  "upgrade",
+]);
+
+/**
+ * Get the effective host value from a request.
+ * HTTP/2 uses the :authority pseudo-header; HTTP/1.1 uses Host.
+ */
+function getRequestHost(req: http.IncomingMessage): string {
+  // HTTP/2 :authority pseudo-header (available via compatibility API)
+  const authority = req.headers[":authority"];
+  if (typeof authority === "string" && authority) return authority;
+  return req.headers.host || "";
+}
+
+/**
  * Build X-Forwarded-* headers for a proxied request.
  */
 function buildForwardedHeaders(req: http.IncomingMessage, tls: boolean): Record<string, string> {
@@ -15,7 +39,7 @@ function buildForwardedHeaders(req: http.IncomingMessage, tls: boolean): Record<
   const remoteAddress = req.socket.remoteAddress || "127.0.0.1";
   const proto = tls ? "https" : "http";
   const defaultPort = tls ? "443" : "80";
-  const hostHeader = req.headers.host || "";
+  const hostHeader = getRequestHost(req);
 
   headers["x-forwarded-for"] = req.headers["x-forwarded-for"]
     ? `${req.headers["x-forwarded-for"]}, ${remoteAddress}`
@@ -28,8 +52,8 @@ function buildForwardedHeaders(req: http.IncomingMessage, tls: boolean): Record<
   return headers;
 }
 
-/** Server type returned by createProxyServer (HTTP/1.1 or HTTP/2+TLS). */
-export type ProxyServer = http.Server | http2.Http2SecureServer;
+/** Server type returned by createProxyServer (HTTP/1.1, HTTP/2+TLS, or net wrapper). */
+export type ProxyServer = http.Server | http2.Http2SecureServer | net.Server;
 
 /**
  * Create an HTTP proxy server that routes requests based on the Host header.
@@ -51,7 +75,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     res.setHeader(PORTLESS_HEADER, "1");
 
     const routes = getRoutes();
-    const host = (req.headers.host || "").split(":")[0];
+    const host = getRequestHost(req).split(":")[0];
 
     if (!host) {
       res.writeHead(400, { "Content-Type": "text/plain" });
@@ -92,6 +116,12 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     for (const [key, value] of Object.entries(forwardedHeaders)) {
       proxyReqHeaders[key] = value;
     }
+    // Remove HTTP/2 pseudo-headers before forwarding to HTTP/1.1 backend
+    for (const key of Object.keys(proxyReqHeaders)) {
+      if (key.startsWith(":")) {
+        delete proxyReqHeaders[key];
+      }
+    }
 
     const proxyReq = http.request(
       {
@@ -102,13 +132,19 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
         headers: proxyReqHeaders,
       },
       (proxyRes) => {
-        res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
+        const responseHeaders: http.OutgoingHttpHeaders = { ...proxyRes.headers };
+        if (isTls) {
+          for (const h of HOP_BY_HOP_HEADERS) {
+            delete responseHeaders[h];
+          }
+        }
+        res.writeHead(proxyRes.statusCode || 502, responseHeaders);
         proxyRes.pipe(res);
       }
     );
 
     proxyReq.on("error", (err) => {
-      onError(`Proxy error for ${req.headers.host}: ${err.message}`);
+      onError(`Proxy error for ${getRequestHost(req)}: ${err.message}`);
       if (!res.headersSent) {
         const errWithCode = err as NodeJS.ErrnoException;
         const message =
@@ -138,7 +174,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
   const handleUpgrade = (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => {
     const routes = getRoutes();
-    const host = (req.headers.host || "").split(":")[0];
+    const host = getRequestHost(req).split(":")[0];
     const route = routes.find((r) => r.hostname === host);
 
     if (!route) {
@@ -181,7 +217,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     });
 
     proxyReq.on("error", (err) => {
-      onError(`WebSocket proxy error for ${req.headers.host}: ${err.message}`);
+      onError(`WebSocket proxy error for ${getRequestHost(req)}: ${err.message}`);
       socket.destroy();
     });
 
@@ -210,13 +246,47 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       cert: tls.cert,
       key: tls.key,
       allowHTTP1: true,
+      ...(tls.SNICallback ? { SNICallback: tls.SNICallback } : {}),
     });
     // With allowHTTP1, the 'request' event receives objects compatible with
     // http.IncomingMessage / http.ServerResponse. Cast to satisfy TypeScript.
     h2Server.on("request", handleRequest as (...args: unknown[]) => void);
     // WebSocket upgrades arrive over HTTP/1.1 connections (allowHTTP1)
     h2Server.on("upgrade", handleUpgrade as (...args: unknown[]) => void);
-    return h2Server;
+
+    // Plain HTTP server using the same proxy handlers (no TLS, no redirect)
+    const plainServer = http.createServer(handleRequest);
+    plainServer.on("upgrade", handleUpgrade);
+
+    // Wrap both in a net.Server that peeks at the first byte to decide
+    // whether the connection is TLS (0x16 = ClientHello) or plain HTTP.
+    const wrapper = net.createServer((socket) => {
+      socket.once("readable", () => {
+        const buf: Buffer | null = socket.read(1);
+        if (!buf) {
+          socket.destroy();
+          return;
+        }
+        socket.unshift(buf);
+        if (buf[0] === 0x16) {
+          // TLS handshake -> HTTP/2 secure server
+          h2Server.emit("connection", socket);
+        } else {
+          // Plain HTTP -> proxy normally over HTTP/1.1
+          plainServer.emit("connection", socket);
+        }
+      });
+    });
+
+    // Proxy close() through to inner servers so tests and cleanup work.
+    const origClose = wrapper.close.bind(wrapper);
+    wrapper.close = function (cb?: (err?: Error) => void) {
+      h2Server.close();
+      plainServer.close();
+      return origClose(cb);
+    } as typeof wrapper.close;
+
+    return wrapper;
   }
 
   const httpServer = http.createServer(handleRequest);

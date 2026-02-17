@@ -1,10 +1,28 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
+import * as tls from "node:tls";
 import { execSync, execFileSync } from "node:child_process";
 
 /** How long the CA certificate is valid (10 years, in days). */
 const CA_VALIDITY_DAYS = 3650;
+
+/**
+ * When running under sudo, fix file ownership so the real user can
+ * read/write the file later without sudo. No-op when not running as root.
+ */
+function fixOwnership(...paths: string[]): void {
+  const uid = process.env.SUDO_UID;
+  const gid = process.env.SUDO_GID;
+  if (!uid || process.getuid?.() !== 0) return;
+  for (const p of paths) {
+    try {
+      fs.chownSync(p, parseInt(uid, 10), parseInt(gid || uid, 10));
+    } catch {
+      // Best-effort
+    }
+  }
+}
 
 /** How long server certificates are valid (1 year, in days). */
 const SERVER_VALIDITY_DAYS = 365;
@@ -110,6 +128,7 @@ function generateCA(stateDir: string): { certPath: string; keyPath: string } {
 
   fs.chmodSync(keyPath, 0o600);
   fs.chmodSync(certPath, 0o644);
+  fixOwnership(keyPath, certPath);
 
   return { certPath, keyPath };
 }
@@ -245,15 +264,41 @@ function isCATrustedMacOS(caCertPath: string): boolean {
       .replace(/^.*=/, "")
       .replace(/:/g, "");
 
-    // Check if a cert with this fingerprint exists in the system keychain
-    const result = execSync(
-      `security find-certificate -a -Z /Library/Keychains/System.keychain 2>/dev/null | grep -i "${fingerprint}"`,
-      { encoding: "utf-8", timeout: 5000 }
-    ).trim();
-    return result.length > 0;
+    // Check the login keychain first, then the system keychain
+    for (const keychain of [loginKeychainPath(), "/Library/Keychains/System.keychain"]) {
+      try {
+        const result = execSync(
+          `security find-certificate -a -Z "${keychain}" 2>/dev/null | grep -i "${fingerprint}"`,
+          { encoding: "utf-8", timeout: 5000 }
+        ).trim();
+        if (result.length > 0) return true;
+      } catch {
+        // Not found in this keychain, try next
+      }
+    }
+    return false;
   } catch {
     return false;
   }
+}
+
+/**
+ * Return the path to the current user's login keychain.
+ */
+function loginKeychainPath(): string {
+  try {
+    const result = execSync("security default-keychain", {
+      encoding: "utf-8",
+      timeout: 5000,
+    }).trim();
+    // Output is like:    "/Users/foo/Library/Keychains/login.keychain-db"
+    const match = result.match(/"(.+)"/);
+    if (match) return match[1];
+  } catch {
+    // Fall back to conventional path
+  }
+  const home = process.env.HOME || `/Users/${process.env.USER || "unknown"}`;
+  return path.join(home, "Library", "Keychains", "login.keychain-db");
 }
 
 function isCATrustedLinux(stateDir: string): boolean {
@@ -270,9 +315,187 @@ function isCATrustedLinux(stateDir: string): boolean {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Per-hostname certificate generation (SNI)
+// ---------------------------------------------------------------------------
+
+/** Directory within state dir where per-hostname certs are cached. */
+const HOST_CERTS_DIR = "host-certs";
+
+/**
+ * Sanitize a hostname for use as a filename.
+ * Replaces dots with underscores and removes non-alphanumeric chars (except - and _).
+ */
+function sanitizeHostForFilename(hostname: string): string {
+  return hostname.replace(/\./g, "_").replace(/[^a-z0-9_-]/gi, "");
+}
+
+/**
+ * Generate a certificate for a specific hostname, signed by the local CA.
+ * Certs are cached on disk in the host-certs subdirectory.
+ */
+function generateHostCert(
+  stateDir: string,
+  hostname: string
+): { certPath: string; keyPath: string } {
+  const caKeyPath = path.join(stateDir, CA_KEY_FILE);
+  const caCertPath = path.join(stateDir, CA_CERT_FILE);
+  const hostDir = path.join(stateDir, HOST_CERTS_DIR);
+
+  if (!fs.existsSync(hostDir)) {
+    fs.mkdirSync(hostDir, { recursive: true, mode: 0o755 });
+    fixOwnership(hostDir);
+  }
+
+  const safeName = sanitizeHostForFilename(hostname);
+  const keyPath = path.join(hostDir, `${safeName}-key.pem`);
+  const certPath = path.join(hostDir, `${safeName}.pem`);
+  const csrPath = path.join(hostDir, `${safeName}.csr`);
+  const extPath = path.join(hostDir, `${safeName}-ext.cnf`);
+
+  // Generate key
+  openssl(["ecparam", "-genkey", "-name", "prime256v1", "-noout", "-out", keyPath]);
+
+  // Generate CSR
+  openssl(["req", "-new", "-key", keyPath, "-out", csrPath, "-subj", `/CN=${hostname}`]);
+
+  // Build SAN list: include the exact hostname plus a wildcard at the same level
+  // e.g., for "chat.json-render2.localhost" -> also add "*.json-render2.localhost"
+  const sans = [`DNS:${hostname}`];
+  const parts = hostname.split(".");
+  if (parts.length >= 2) {
+    // Add a wildcard for sibling subdomains at the same level
+    sans.push(`DNS:*.${parts.slice(1).join(".")}`);
+  }
+
+  fs.writeFileSync(
+    extPath,
+    [
+      "authorityKeyIdentifier=keyid,issuer",
+      "basicConstraints=CA:FALSE",
+      "keyUsage=digitalSignature,keyEncipherment",
+      "extendedKeyUsage=serverAuth",
+      `subjectAltName=${sans.join(",")}`,
+    ].join("\n") + "\n"
+  );
+
+  openssl([
+    "x509",
+    "-req",
+    "-in",
+    csrPath,
+    "-CA",
+    caCertPath,
+    "-CAkey",
+    caKeyPath,
+    "-CAcreateserial",
+    "-out",
+    certPath,
+    "-days",
+    SERVER_VALIDITY_DAYS.toString(),
+    "-extfile",
+    extPath,
+  ]);
+
+  // Clean up temp files
+  for (const tmp of [csrPath, extPath, path.join(stateDir, "ca.srl")]) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // Non-fatal
+    }
+  }
+
+  fs.chmodSync(keyPath, 0o600);
+  fs.chmodSync(certPath, 0o644);
+  fixOwnership(keyPath, certPath);
+
+  return { certPath, keyPath };
+}
+
+/**
+ * Check if a hostname matches `*.localhost` (single-level subdomain).
+ * These are covered by the default server cert's wildcard SAN.
+ */
+function isSimpleLocalhostSubdomain(hostname: string): boolean {
+  const parts = hostname.split(".");
+  // "foo.localhost" => ["foo", "localhost"] => 2 parts
+  return parts.length === 2 && parts[1] === "localhost";
+}
+
+/**
+ * Create an SNI callback for the TLS server.
+ *
+ * For simple hostnames matching `*.localhost`, uses the default server cert.
+ * For deeper subdomains (e.g., `chat.myapp.localhost`), generates a
+ * per-hostname certificate on demand, signed by the local CA, and caches it.
+ */
+export function createSNICallback(
+  stateDir: string,
+  defaultCert: Buffer,
+  defaultKey: Buffer
+): (servername: string, cb: (err: Error | null, ctx?: tls.SecureContext) => void) => void {
+  const cache = new Map<string, tls.SecureContext>();
+
+  // Pre-cache the default context for simple subdomains
+  const defaultCtx = tls.createSecureContext({ cert: defaultCert, key: defaultKey });
+
+  return (servername: string, cb: (err: Error | null, ctx?: tls.SecureContext) => void) => {
+    // Simple subdomains (foo.localhost) and "localhost" itself are covered by the default cert
+    if (servername === "localhost" || isSimpleLocalhostSubdomain(servername)) {
+      cb(null, defaultCtx);
+      return;
+    }
+
+    // Check memory cache
+    if (cache.has(servername)) {
+      cb(null, cache.get(servername));
+      return;
+    }
+
+    // Check if a cert already exists on disk
+    const safeName = sanitizeHostForFilename(servername);
+    const hostDir = path.join(stateDir, HOST_CERTS_DIR);
+    const certPath = path.join(hostDir, `${safeName}.pem`);
+    const keyPath = path.join(hostDir, `${safeName}-key.pem`);
+
+    // Try reading existing cert from disk (may fail if files are root-owned)
+    if (fileExists(certPath) && fileExists(keyPath) && isCertValid(certPath)) {
+      try {
+        const ctx = tls.createSecureContext({
+          cert: fs.readFileSync(certPath),
+          key: fs.readFileSync(keyPath),
+        });
+        cache.set(servername, ctx);
+        cb(null, ctx);
+        return;
+      } catch {
+        // Permission error reading cached cert -- regenerate below
+      }
+    }
+
+    // Generate a new cert for this hostname
+    try {
+      const generated = generateHostCert(stateDir, servername);
+      const ctx = tls.createSecureContext({
+        cert: fs.readFileSync(generated.certPath),
+        key: fs.readFileSync(generated.keyPath),
+      });
+      cache.set(servername, ctx);
+      cb(null, ctx);
+    } catch (err: unknown) {
+      cb(err instanceof Error ? err : new Error(String(err)));
+    }
+  };
+}
+
 /**
  * Add the portless CA to the system trust store.
- * Returns whether the operation succeeded. May require sudo.
+ *
+ * On macOS, adds to the login keychain (no sudo required -- the OS shows a
+ * GUI authorization prompt to confirm). On Linux, copies to
+ * /usr/local/share/ca-certificates and runs update-ca-certificates (requires
+ * sudo).
  */
 export function trustCA(stateDir: string): { trusted: boolean; error?: string } {
   const caCertPath = path.join(stateDir, CA_CERT_FILE);
@@ -282,10 +505,11 @@ export function trustCA(stateDir: string): { trusted: boolean; error?: string } 
 
   try {
     if (process.platform === "darwin") {
-      execSync(
-        `security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "${caCertPath}"`,
-        { stdio: "pipe", timeout: 30_000 }
-      );
+      const keychain = loginKeychainPath();
+      execSync(`security add-trusted-cert -r trustRoot -k "${keychain}" "${caCertPath}"`, {
+        stdio: "pipe",
+        timeout: 30_000,
+      });
       return { trusted: true };
     } else if (process.platform === "linux") {
       const dest = "/usr/local/share/ca-certificates/portless-ca.crt";

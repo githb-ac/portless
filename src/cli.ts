@@ -6,7 +6,7 @@ import chalk from "chalk";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { ensureCerts, isCATrusted, trustCA } from "./certs.js";
+import { createSNICallback, ensureCerts, isCATrusted, trustCA } from "./certs.js";
 import { createProxyServer } from "./proxy.js";
 import { formatUrl, isErrnoException, parseHostname } from "./utils.js";
 import { FILE_MODE, RouteStore } from "./routes.js";
@@ -476,7 +476,7 @@ ${chalk.bold("How it works:")}
 ${chalk.bold("HTTP/2 + HTTPS:")}
   Use --https for HTTP/2 multiplexing (faster dev server page loads).
   On first use, portless generates a local CA and adds it to your
-  system trust store (requires sudo once). No browser warnings.
+  system trust store. No browser warnings. No sudo required on macOS.
 
 ${chalk.bold("Options:")}
   -p, --port <number>           Port for the proxy to listen on (default: 1355)
@@ -644,7 +644,7 @@ ${chalk.bold("Usage: portless proxy <command>")}
     }
 
     // Prepare TLS options if HTTPS is requested
-    let tlsOptions: { cert: Buffer; key: Buffer } | undefined;
+    let tlsOptions: import("./types.js").ProxyServerOptions["tls"];
     if (useHttps) {
       store.ensureDir();
       if (customCertPath && customKeyPath) {
@@ -683,13 +683,16 @@ ${chalk.bold("Usage: portless proxy <command>")}
             console.warn(
               chalk.yellow("Browsers will show certificate warnings. To fix this later, run:")
             );
-            console.warn(chalk.cyan("  sudo portless trust"));
+            console.warn(chalk.cyan("  portless trust"));
           }
         }
 
+        const cert = fs.readFileSync(certs.certPath);
+        const key = fs.readFileSync(certs.keyPath);
         tlsOptions = {
-          cert: fs.readFileSync(certs.certPath),
-          key: fs.readFileSync(certs.keyPath),
+          cert,
+          key,
+          SNICallback: createSNICallback(stateDir, cert, key),
         };
       }
     }
