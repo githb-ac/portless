@@ -11,4 +11,14 @@ export interface ProxyServerOptions {
   proxyPort: number;
   /** Optional error logger; defaults to console.error. */
   onError?: (message: string) => void;
+  /** When provided, enables HTTP/2 over TLS (HTTPS). */
+  tls?: {
+    cert: Buffer;
+    key: Buffer;
+    /** SNI callback for per-hostname certificate selection. */
+    SNICallback?: (
+      servername: string,
+      cb: (err: Error | null, ctx?: import("node:tls").SecureContext) => void
+    ) => void;
+  };
 }
